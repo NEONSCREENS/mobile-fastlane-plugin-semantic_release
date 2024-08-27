@@ -20,8 +20,22 @@ module Fastlane
         Actions.sh(command, log: params[:debug]).chomp
       end
 
+      def self.should_exclude_commit(params)
+        commit_scope = params[:commit_scope]
+        scopes_to_include = params[:include_scopes]
+        scopes_to_ignore = params[:ignore_scopes]
+
+        unless scopes_to_include.empty?
+          return !scopes_to_include.include?(commit_scope)
+        end
+
+        unless commit_scope.nil?
+          return scopes_to_ignore.include?(commit_scope)
+        end
+      end
+
       def self.parse_commit(params)
-        commit_subject = params[:commit_subject].strip
+        commit_subject = params[:commit_subject].to_s.strip
         commit_body = params[:commit_body]
         releases = params[:releases]
         codepush_friendly = params[:codepush_friendly]
