@@ -46,6 +46,14 @@ module Fastlane
       end
 
       def self.note_builder(format, commits, version, commit_url, params)
+        if(params[:group_by_scope])
+          note_builder_grouped(format, commits, version, commit_url, params)
+        else
+          note_builder_ungrouped(format, commits, version, commit_url, params)
+        end
+      end
+
+      def self.note_builder_ungrouped(format, commits, version, commit_url, params)
         sections = params[:sections]
 
         result = ""
@@ -122,6 +130,227 @@ module Fastlane
         result
       end
 
+      def self.validate_sections(sections)
+        # Ensure sections is a hash
+        unless sections.is_a?(Hash)
+          UI.user_error!("sections parameter must be a Hash, got #{sections.class}")
+        end
+
+        # Ensure no_type section exists as it's used as fallback for commits without scope
+        unless sections.key?(:no_type)
+          UI.user_error!("sections parameter must include a :no_type key for commits without scope. " \
+                         "Add 'no_type: \"Other work\"' to your sections configuration.")
+        end
+
+        # Ensure no_type value is not nil or empty
+        if sections[:no_type].nil? || sections[:no_type].to_s.strip.empty?
+          UI.user_error!("sections[:no_type] cannot be nil or empty. " \
+                         "Provide a meaningful section name like 'Other work'.")
+        end
+      end
+
+      def self.normalize_scope(scope, fallback_scope)
+        # Normalize scope by trimming whitespace and handling empty/nil values
+        normalized = scope.nil? ? nil : scope.strip
+        if normalized.nil? || normalized.empty?
+          fallback_scope
+        else
+          normalized
+        end
+      end
+
+      def self.normalize_scope_for_grouping(scope)
+        # Normalize scope to lowercase for consistent grouping
+        # This ensures "cache", "Cache", and "CACHE" all group together
+        return nil if scope.nil?
+
+        normalized = scope.downcase
+
+        # Map semantically related scopes to a canonical form
+        # "Cleanup" and "Refactor" are grouped together as "refactor"
+        case normalized
+        when /^cleanup/
+          'refactor'
+        when /^refactor/
+          'refactor'
+        when /^any/
+          'any'
+        else
+          normalized
+        end
+      end
+
+      def self.is_semantic_mapping?(scope)
+        # Check if a scope has a semantic mapping (e.g., Cleanup -> refactor)
+        return false if scope.nil?
+        normalized = scope.downcase
+        case normalized
+        when /^cleanup/, /^refactor/, /^any/
+          true
+        else
+          false
+        end
+      end
+
+      def self.capitalize_scope(scope)
+        # Capitalize the first letter of the scope for display
+        # Examples: "offline" -> "Offline", "OFFLINE" -> "Offline", "PlaylistRepository" -> "PlaylistRepository"
+        return nil if scope.nil?
+        return scope if scope.empty?
+
+        # If the scope is all uppercase (like "OFFLINE"), convert to title case
+        if scope == scope.upcase && scope.length > 1
+          scope[0].upcase + scope[1..-1].downcase
+        else
+          # Otherwise, just ensure first letter is uppercase
+          scope[0].upcase + scope[1..-1]
+        end
+      end
+
+      def self.note_builder_grouped(format, commits, version, commit_url, params)
+        sections = params[:sections]
+        validate_sections(sections)
+        lines = []
+
+        if params[:display_title] == true
+          lines << build_title(version, params)
+          lines << ""
+        end
+
+        commits_by_type = commits.group_by { |c| c[:type] }
+        params[:order].each do |type|
+          commits_in_type = commits_by_type[type]
+          next if commits_in_type.nil? || commits_in_type.size == 0
+
+          # Filter out merge commits at the type level first
+          non_merge_commits_in_type = commits_in_type.reject { |commit| commit[:is_merge] }
+          next if non_merge_commits_in_type.empty?
+
+          type_text = style_text_grouped(sections[type.to_sym], format, "heading").to_s
+          lines << type_text
+
+          # Group commits by normalized scope (lowercase) for consistent grouping
+          # but preserve the original scope for display (unless it's a semantic mapping)
+          commits_by_normalized_scope = non_merge_commits_in_type.group_by do |c|
+            normalized = normalize_scope(c[:scope], sections[:no_type])
+            normalize_scope_for_grouping(normalized)
+          end
+
+          # Build a map of normalized scope -> display scope
+          # For semantic mappings (Cleanup->refactor, Refactor->refactor), use the canonical form
+          # For other scopes, use the original scope
+          normalized_to_display = {}
+          non_merge_commits_in_type.each do |commit|
+            normalized = normalize_scope(commit[:scope], sections[:no_type])
+            normalized_for_grouping = normalize_scope_for_grouping(normalized)
+
+            # Determine display scope
+            if is_semantic_mapping?(normalized)
+              # This is a semantic mapping (e.g., Cleanup -> refactor)
+              display_scope = normalized_for_grouping
+            else
+              # Use the original scope for display
+              display_scope = normalized
+            end
+
+            normalized_to_display[normalized_for_grouping] ||= display_scope
+          end
+
+          # Sort scopes alphabetically, but put fallback scope last
+          sorted_normalized_scopes = commits_by_normalized_scope.keys.sort do |a, b|
+            fallback_normalized = normalize_scope_for_grouping(sections[:no_type])
+            if a == fallback_normalized && b != fallback_normalized
+              1  # fallback scope comes last
+            elsif a != fallback_normalized && b == fallback_normalized
+              -1  # named scope comes first
+            else
+              a.casecmp(b)  # alphabetical sort (case-insensitive)
+            end
+          end
+
+          sorted_normalized_scopes.each do |normalized_scope|
+            commits_in_scope = commits_by_normalized_scope[normalized_scope]
+            # Use the canonical display scope (from normalize_scope_for_grouping)
+            display_scope = normalized_to_display[normalized_scope]
+            # Capitalize the first letter of the scope for display
+            capitalized_scope = capitalize_scope(display_scope)
+            scope = style_text_grouped("#{capitalized_scope}:", format, "bold").to_s
+
+            is_single_commit = commits_in_scope.size == 1
+            if is_single_commit
+              commit = commits_in_scope.first
+              commit_text = build_commit_grouped(params, commit, is_single_commit)
+              lines << "#{scope} #{commit_text}"
+            else
+              lines << scope
+
+              commits_in_scope.each do |commit|
+                commit_text = build_commit_grouped(params, commit, is_single_commit)
+                lines << commit_text
+              end
+            end
+          end
+        end
+
+        lines.join("\n")
+      end
+
+      def self.build_commit(params, commit, is_single_commit)
+        result = ""
+        format = params[:format]
+
+        if is_single_commit
+          result += " #{commit[:subject]}"
+        else
+          result += "   - #{commit[:subject]}"
+        end
+
+        if params[:display_links] == true
+          commit_url = params[:commit_url]
+
+          styled_link = build_commit_link(commit, commit_url, format).to_s
+
+          result += " (#{styled_link})"
+        end
+
+        if params[:display_author]
+          result += " - #{commit[:author_name]}"
+        end
+
+        result
+      end
+
+      def self.build_commit_grouped(params, commit, is_single_commit)
+        result = ""
+        format = params[:format]
+
+        sanitized_subject = commit[:subject].strip
+
+        if is_single_commit
+          result += sanitized_subject
+        else
+          if format == "slack"
+            result += "    - #{sanitized_subject}"
+          else
+            result += "   - #{sanitized_subject}"
+          end
+        end
+
+        if params[:display_links] == true
+          commit_url = params[:commit_url]
+
+          styled_link = build_commit_link(commit, commit_url, format).to_s
+
+          result += " (#{styled_link})"
+        end
+
+        if params[:display_author]
+          result += " - #{commit[:author_name]}"
+        end
+
+        result
+      end
+
       def self.style_text(text, format, style)
         # formats the text according to the style we're looking to use
 
@@ -156,6 +385,38 @@ module Fastlane
         end
       end
 
+      def self.style_text_grouped(text, format, style)
+        # formats the text according to the style we're looking to use
+        case style
+        when "title"
+          if format == "markdown"
+            "# #{text}"
+          elsif format == "slack"
+            "*#{text}*"
+          else
+            text
+          end
+        when "heading"
+          if format == "markdown"
+            "### #{text}"
+          elsif format == "slack"
+            "*#{text}*"
+          else
+            "#{text}:"
+          end
+        when "bold"
+          if format == "markdown"
+            "- **#{text}**"
+          elsif format == "slack"
+            "- *#{text}*"
+          else
+            "- #{text}"
+          end
+        else
+          text # catchall, shouldn't be needed
+        end
+      end
+
       def self.build_commit_link(commit, commit_url, format)
         # formats the link according to the output format we need
         short_hash = commit[:short_hash]
@@ -170,6 +431,15 @@ module Fastlane
         else
           url
         end
+      end
+
+      def self.build_title(version, params)
+        title = version
+        title += " #{params[:title]}" if params[:title]
+        title += " (#{Date.today})"
+
+        format = params[:format]
+        style_text(title, format, "title").to_s
       end
 
       def self.parse_commits(commits, params)
@@ -299,7 +569,14 @@ module Fastlane
             default_value: false,
             type: Boolean,
             optional: true
-          )
+          ),
+          FastlaneCore::ConfigItem.new(
+            key: :group_by_scope,
+            description: "True if you want to group multiple changes by scope name",
+            default_value: false,
+            type: Boolean,
+            optional: true
+          ),
         ]
       end
 
